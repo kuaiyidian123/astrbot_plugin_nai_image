@@ -1,0 +1,21 @@
+name: astrbot_plugin_nai_image
+display_name: AI 生图 (NovelAI/吐司)
+version: 1.0.0
+author: kuaiyidian123
+desc: |
+  AI 生图插件。发送 /生图 中文描述，先由大模型把中文转换成英文绘画 tag，再调用 NovelAI 生成二次元插画并发送。
+  也支持 /生图 吐司 中文描述 改走吐司（TAMS / tusi.cn）工作流模板接口。
+
+  ## 功能说明
+  - 🎨 `/生图 中文描述`：大模型转英文绘画 tag → NovelAI 生图（V4.5/V5）
+  - 🍞 `/生图 吐司 中文描述`：改走吐司（TAMS）工作流模板接口生图
+  - 📖 `/生图帮助`：查看当前配置、可用转换模型 ID 与今日剩余次数
+  - 🔢 支持每人每日次数上限，生图成功才计数
+  - 🌐 支持 HTTP 代理，便于访问 NovelAI / 吐司接口
+
+  ## 指令说明
+  - `/生图 中文描述`：走 NovelAI 生图
+  - `/生图 吐司 中文描述`：走吐司生图
+  - `/生图帮助`：查看用法与配置
+
+astrbot_version: '>=4.17.0'
