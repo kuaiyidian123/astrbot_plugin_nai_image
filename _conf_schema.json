@@ -100,6 +100,24 @@
     "default": "",
     "description": "模板中用于填写负面提示词的字段名。留空时自动识别（匹配含 negative / 负面 / 反向 的字段）；模板没有该字段时会自动跳过。"
   },
+  "tusi_open_access_key": {
+    "type": "string",
+    "title": "吐司 OpenAPI Access Key",
+    "default": "",
+    "description": "吐司（TensorArt）OpenAPI 的 Access Key，在 tusi.cn / tensor.art 个人资料页获取。填好后可用「/生图 吐司API [工具名] 描述」。以 ak_tusi 开头的 Key 自动走国内站 openapi.tusiart.cn，其余走 openapi.tensor.art。"
+  },
+  "tusi_open_base_url": {
+    "type": "string",
+    "title": "吐司 OpenAPI 接口地址（可留空）",
+    "default": "",
+    "description": "留空时按 Access Key 前缀自动选择：ak_tusi → https://openapi.tusiart.cn/openworks/v1，其余 → https://openapi.tensor.art/openworks/v1。需要固定某个站点时可手动填写。"
+  },
+  "tusi_open_tool": {
+    "type": "string",
+    "title": "吐司 OpenAPI 默认工具",
+    "default": "anime_lab_wai_illustrious",
+    "description": "不指定工具名时「/生图 吐司API 描述」使用的默认 AI Tool。可发「/生图工具」查看全部可用工具（如 strong_text2image_nano_banana2、text2video_wan27 等）。"
+  },
   "http_proxy": {
     "type": "string",
     "title": "HTTP代理地址",

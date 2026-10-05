@@ -14,6 +14,7 @@ import time
 import random
 import hashlib
 import asyncio
+import mimetypes
 import tempfile
 import zipfile
 import urllib.parse
@@ -69,6 +70,36 @@ TUSI_MAX_JSON_BYTES = 2 * 1024 * 1024   # 接口 JSON 响应上限
 TUSI_MAX_IMAGE_BYTES = 32 * 1024 * 1024  # 结果图片上限
 
 
+# ============ 吐司 OpenAPI（OpenWorks / AI Tool）============
+TUSI_OPEN_HOST_TENSOR = "https://openapi.tensor.art/openworks/v1"
+TUSI_OPEN_HOST_TUSI = "https://openapi.tusiart.cn/openworks/v1"
+TUSI_OPEN_KEY_PREFIX_TUSI = "ak_tusi"    # Access Key 以此前缀开头则走国内站
+TUSI_OPEN_REQUEST_TIMEOUT = 60            # 单次接口请求超时（秒）
+TUSI_OPEN_JOB_TIMEOUT = 900               # 任务整体等待上限（秒，视频可能较久）
+TUSI_OPEN_POLL_INTERVAL = 4               # 任务轮询间隔（秒）
+TUSI_OPEN_MAX_JSON_BYTES = 4 * 1024 * 1024      # 接口 JSON 响应上限
+TUSI_OPEN_MAX_FILE_BYTES = 64 * 1024 * 1024     # 参考文件读取/上传上限
+TUSI_OPEN_MAX_RESULT_BYTES = 128 * 1024 * 1024  # 结果文件下载上限
+TUSI_OPEN_TOOL_CACHE_TTL = 600            # 工具列表缓存时长（秒）
+TUSI_OPEN_MAX_RESULTS = 4                 # 单次最多发送的结果数量
+
+# 让对话模型按工具定义生成 inputs（位置数组）的系统提示词
+TUSI_OPEN_INPUT_SYSTEM_PROMPT = (
+    "你是吐司(TensorArt)生成任务的参数生成器。"
+    "用户会给你一个工具定义(含 inputs 列表)、用户需求(requirement)和已上传的参考图 URL(referenceImages)。\n"
+    "请严格按 inputs 定义的顺序，为每个输入生成符合其类型与含义的取值，输出 JSON 数组。\n"
+    "每个元素为 {\"type\": <原类型>, \"value\": <值>}，顺序与数量必须与 inputs 定义完全一致。\n"
+    "规则：\n"
+    "1. 提示词/文本类字段：输出具体、贴合需求的英文提示词（保留必要的专有名词）\n"
+    "2. 尺寸类字段：给出合理数值（图片常见 512~1024，视频常见 480~720）\n"
+    "3. 数量类字段：默认 1（用户要求多张时按需，但不要超过 4）\n"
+    "4. 布尔类字段：按常理给 true/false\n"
+    "5. FILE 类型：若 referenceImages 提供了图片则用其中的 URL（多个按需分配），没有就填空字符串\n"
+    "6. 不要使用无意义的占位值；负向提示词类字段可给出常用内容\n"
+    "只输出 JSON 数组本身，不要任何解释或代码块标记。"
+)
+
+
 def _split_tusi_prefix(text: str) -> tuple:
     """识别「/生图 吐司 xxx」中的渠道前缀，返回 (是否走吐司, 剩余描述)
 
@@ -81,6 +112,41 @@ def _split_tusi_prefix(text: str) -> tuple:
     if raw == "吐司":
         return True, ""
     return False, raw
+
+
+def _split_tusi_open_prefix(text: str) -> tuple:
+    """识别「/生图 吐司API xxx」中的渠道前缀，返回 (是否走 OpenAPI, 剩余描述)
+
+    「吐司API」后必须跟空白或分隔符才算前缀，避免与 TAMS 的「吐司」前缀互相误判。
+    """
+    raw = (text or "").strip()
+    m = re.match(r"^吐司\s*api(?:\s+|[,，:：]+\s*)(.+)$", raw, re.IGNORECASE)
+    if m:
+        return True, m.group(1).strip()
+    if re.fullmatch(r"吐司\s*api", raw, re.IGNORECASE):
+        return True, ""
+    return False, raw
+
+
+def _extract_json_array(text: str) -> Optional[list]:
+    """从模型输出里提取第一个 JSON 数组"""
+    m = re.search(r"\[.*\]", text or "", re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return None
+    return obj if isinstance(obj, list) else None
+
+
+# 结果媒体类型判定：优先按响应 Content-Type，其次按 URL 扩展名
+_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".m4v")
+_MEDIA_EXT_BY_CTYPE = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+    "image/webp": ".webp", "image/gif": ".gif",
+    "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+}
 
 
 def _parse_nai_size(value, default: tuple = (832, 1216)) -> tuple:
@@ -138,6 +204,9 @@ DEFAULT_CONFIG = {
     "tusi_template_id": "",
     "tusi_prompt_field": "",
     "tusi_negative_field": "",
+    "tusi_open_access_key": "",
+    "tusi_open_base_url": "",
+    "tusi_open_tool": "anime_lab_wai_illustrious",
     "http_proxy": ""
 }
 
@@ -156,8 +225,8 @@ TEMP_FILE_PREFIX = "nai_image_"
 @register(
     "astrbot_plugin_nai_image",
     "kuaiyidian123",
-    "AI 生图插件：/生图 中文描述 走 NovelAI，/生图 吐司 描述 走吐司（tusi.cn），由大模型先把中文转成英文绘画 tag",
-    "1.0.0",
+    "AI 生图插件：/生图 中文描述 走 NovelAI，/生图 吐司 描述 走吐司（TAMS），/生图 吐司API 描述 走吐司 OpenAPI，由大模型生成绘画 tag/参数",
+    "1.1.0",
 )
 class NaiImagePlugin(Star):
     """AI 生图插件（NovelAI / 吐司）"""
@@ -181,6 +250,7 @@ class NaiImagePlugin(Star):
 
         self._img_quota: Dict[str, Dict[str, Any]] = {}  # /生图 每日次数统计（按用户隔离）
         self._img_busy: set = set()                      # 正在生图的用户，防重复触发烧额度
+        self._tusi_open_tools: Dict[str, Any] = {"ts": 0.0, "tools": []}  # 吐司 OpenAPI 工具列表缓存
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._last_temp_cleanup = 0.0  # 上次临时文件清理时间戳（节流用）
         self._session_lock = asyncio.Lock()  # 保护 HTTP 会话创建，避免并发重复建连
@@ -742,26 +812,371 @@ class NaiImagePlugin(Star):
             logger.error(f"吐司生图请求失败: {e}")
             return None, "❌ 吐司生图请求失败，请稍后重试"
 
+    # ==================== 吐司 OpenAPI（OpenWorks / AI Tool）渠道 ====================
+
+    def _tusi_open_key(self) -> str:
+        return str(self.config.get("tusi_open_access_key") or "").strip()
+
+    def _tusi_open_cfg(self) -> Dict[str, Any]:
+        """解析吐司 OpenAPI 配置（Access Key 前缀决定站点，可用配置项手动覆盖）"""
+        key = self._tusi_open_key()
+        base = str(self.config.get("tusi_open_base_url") or "").strip().rstrip("/")
+        if not base:
+            base = (TUSI_OPEN_HOST_TUSI if key.startswith(TUSI_OPEN_KEY_PREFIX_TUSI)
+                    else TUSI_OPEN_HOST_TENSOR)
+        return {
+            "base_url": base,
+            "key": key,
+            "default_tool": str(self.config.get("tusi_open_tool") or "").strip(),
+        }
+
+    def _tusi_open_ready(self) -> bool:
+        return bool(self._tusi_open_key())
+
+    @staticmethod
+    def _tusi_open_error_msg(status: int, body: bytes) -> str:
+        """把吐司 OpenAPI 的 HTTP 错误转成可读提示"""
+        detail = ""
+        try:
+            obj = json.loads(body.decode("utf-8", "ignore"))
+            if isinstance(obj, dict):
+                detail = str(obj.get("message") or obj.get("msg") or obj.get("error") or "").strip()
+        except Exception:
+            detail = ""
+        if status == 401:
+            return "❌ 吐司 Access Key 无效或已过期，请检查后台「吐司 OpenAPI Access Key」"
+        if status == 403:
+            return "❌ 吐司拒绝访问（403），请确认该 Access Key 的权限或算力余额"
+        if status == 429:
+            return "⚠️ 吐司请求过于频繁（被限流），请稍后再试"
+        tail = f"\n{detail}" if detail else ""
+        return f"❌ 吐司 OpenAPI 请求失败（HTTP {status}）{tail}"
+
+    async def _tusi_open_api(self, cfg: Dict[str, Any], path: str, data: Dict[str, Any]) -> tuple:
+        """调用吐司 OpenAPI（统一 POST），返回 (data 字典, 错误文案)"""
+        url = f"{cfg['base_url']}/{path}"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Echo-Access-Key": cfg["key"],
+            "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        }
+        try:
+            session = await self._get_http_session()
+            async with session.post(
+                url, json=data, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=TUSI_OPEN_REQUEST_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                body = await self._read_capped(resp, TUSI_OPEN_MAX_JSON_BYTES)
+                if body is None:
+                    return None, "❌ 吐司接口返回内容过大，已中止接收"
+                if resp.status != 200:
+                    logger.warning(f"吐司 OpenAPI {path} 失败 HTTP {resp.status}")
+                    return None, self._tusi_open_error_msg(resp.status, body)
+            obj = json.loads(body.decode("utf-8", "ignore")) or {}
+        except aiohttp.ClientConnectionError as e:
+            host = urllib.parse.urlparse(cfg["base_url"]).netloc or cfg["base_url"]
+            logger.error(f"吐司 OpenAPI 连接失败 {host}: {e}")
+            return None, (
+                f"❌ 无法连接到吐司 OpenAPI：{host}\n"
+                "若被网络阻断，可在后台「HTTP 代理」填写本地代理地址。"
+            )
+        except asyncio.TimeoutError:
+            return None, "⏰ 吐司 OpenAPI 请求超时，请稍后重试"
+        except Exception as e:
+            logger.error(f"吐司 OpenAPI 请求失败（{path}）: {e}")
+            return None, "❌ 吐司 OpenAPI 请求失败，请稍后重试"
+        if str(obj.get("code")) != "0":
+            detail = str(obj.get("message") or obj.get("msg") or "").strip()
+            if not detail:
+                detail = json.dumps(obj, ensure_ascii=False)[:200]
+            return None, f"❌ 吐司 OpenAPI 返回错误：{detail}"
+        return obj.get("data") or {}, None
+
+    async def _tusi_open_list_tools(self, cfg: Dict[str, Any], force: bool = False) -> tuple:
+        """获取工具列表（带缓存），返回 (工具列表, 错误文案)"""
+        cache = self._tusi_open_tools
+        if (not force and cache.get("tools")
+                and time.time() - cache.get("ts", 0) < TUSI_OPEN_TOOL_CACHE_TTL):
+            return cache["tools"], None
+        data, err = await self._tusi_open_api(cfg, "tool/list", {})
+        if err:
+            return None, err
+        if isinstance(data, list):
+            tools = data
+        else:
+            tools = data.get("tools") or data.get("list") or data.get("items") or []
+        if not isinstance(tools, list):
+            tools = []
+        self._tusi_open_tools = {"ts": time.time(), "tools": tools}
+        return tools, None
+
+    async def _tusi_open_find_tool(self, cfg: Dict[str, Any], name: str) -> tuple:
+        """按名称查找工具，返回 (工具定义, 错误文案)；找不到时返回 (None, None)"""
+        target = str(name or "").strip().lower()
+        if not target:
+            return None, None
+        tools, err = await self._tusi_open_list_tools(cfg)
+        if err:
+            return None, err
+        for tool in tools:
+            if str((tool or {}).get("name") or "").strip().lower() == target:
+                return tool, None
+        return None, None
+
+    async def _resolve_tusi_open_tool(self, cfg: Dict[str, Any], text: str) -> tuple:
+        """解析「可选工具名 + 描述」，返回 (工具名, 描述, 错误文案)"""
+        raw = (text or "").strip()
+        first, _, rest = raw.partition(" ")
+        tool_name = ""
+        if first:
+            tool, err = await self._tusi_open_find_tool(cfg, first)
+            if err:
+                return cfg["default_tool"], raw, err
+            if tool is not None:
+                tool_name = str(tool.get("name"))
+                raw = rest.strip()
+        if not tool_name:
+            tool_name = cfg["default_tool"]
+        return tool_name, raw, None
+
+    async def _tusi_open_upload(self, cfg: Dict[str, Any], data: bytes, filename: str) -> tuple:
+        """上传本地文件到吐司，返回 (文件 URL, 错误文案)"""
+        payload, err = await self._tusi_open_api(cfg, "file/upload", {"filename": filename})
+        if err:
+            return None, err
+        upload_url = str(payload.get("uploadUrl") or "").strip()
+        file_url = str(payload.get("displayUrl") or payload.get("accessUrl") or "").strip()
+        if not upload_url:
+            return None, "❌ 吐司未返回上传地址"
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        try:
+            session = await self._get_http_session()
+            async with session.put(
+                upload_url, data=data, headers={"Content-Type": ctype},
+                timeout=aiohttp.ClientTimeout(total=TUSI_OPEN_REQUEST_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"吐司上传文件失败 HTTP {resp.status}")
+                    return None, f"❌ 上传参考文件失败（HTTP {resp.status}）"
+        except Exception as e:
+            logger.error(f"吐司上传文件失败: {e}")
+            return None, "❌ 上传参考文件失败，请稍后重试"
+        if not file_url:
+            return None, "❌ 吐司未返回文件访问地址"
+        return file_url, None
+
+    async def _tusi_open_fetch_image(self, src: str) -> tuple:
+        """把消息里的图片来源统一取成 (字节, 文件名)"""
+        src = str(src or "").strip()
+        if not src:
+            return None, None
+        if src.startswith(("http://", "https://")):
+            try:
+                session = await self._get_http_session()
+                async with session.get(
+                    src, timeout=aiohttp.ClientTimeout(total=TUSI_OPEN_REQUEST_TIMEOUT),
+                    proxy=self._get_proxy(),
+                ) as resp:
+                    if resp.status != 200:
+                        return None, None
+                    body = await self._read_capped(resp, TUSI_OPEN_MAX_FILE_BYTES)
+                if not body:
+                    return None, None
+                name = os.path.basename(urllib.parse.urlparse(src).path) or "reference.png"
+                return body, name
+            except Exception as e:
+                logger.warning(f"下载消息图片失败: {e}")
+                return None, None
+        try:
+            if os.path.isfile(src):
+                with open(src, "rb") as f:
+                    return f.read(), os.path.basename(src)
+        except OSError:
+            pass
+        return None, None
+
+    async def _tusi_open_build_inputs(self, tool: Dict[str, Any],
+                                      requirement: str, image_urls: List[str]) -> tuple:
+        """用对话模型按工具定义生成 inputs（位置数组），返回 (inputs, 错误文案)"""
+        inputs_def = tool.get("inputs") or []
+        prov, err = await self._resolve_tag_provider()
+        if err:
+            return None, err
+        payload = {
+            "toolName": tool.get("name"),
+            "description": tool.get("description"),
+            "inputs": inputs_def,
+            "requirement": requirement,
+            "referenceImages": image_urls,
+        }
+        try:
+            resp = await prov.text_chat(
+                prompt=json.dumps(payload, ensure_ascii=False),
+                system_prompt=TUSI_OPEN_INPUT_SYSTEM_PROMPT,
+            )
+        except Exception as e:
+            logger.error(f"调用对话模型生成吐司参数失败: {e}")
+            return None, f"❌ 调用对话模型生成参数失败\n{_describe_llm_error(e)}"
+        raw = str(getattr(resp, "completion_text", "") or "").strip()
+        items = _extract_json_array(raw)
+        if items is None or (not items and inputs_def):
+            logger.warning(f"吐司参数生成解析失败，原始输出: {raw[:200]}")
+            return None, "❌ 参数生成结果格式异常，请重试或换个描述"
+        normalized: List[Dict[str, Any]] = []
+        for i, item in enumerate(items):
+            # 类型以工具定义为准（模型可能改写类型导致接口校验失败）
+            if i < len(inputs_def):
+                t = str((inputs_def[i] or {}).get("type") or "STRING")
+            elif isinstance(item, dict) and item.get("type"):
+                t = str(item["type"])
+            else:
+                t = "STRING"
+            value = item.get("value") if isinstance(item, dict) and "value" in item else item
+            normalized.append({"type": t, "value": value})
+        return normalized, None
+
+    async def _tusi_open_wait(self, cfg: Dict[str, Any], task_id: str) -> tuple:
+        """轮询任务直到终态，返回 (结果 URL 列表, 错误文案)"""
+        deadline = time.monotonic() + TUSI_OPEN_JOB_TIMEOUT
+        last_status = ""
+        while time.monotonic() < deadline:
+            await asyncio.sleep(TUSI_OPEN_POLL_INTERVAL)
+            data, err = await self._tusi_open_api(cfg, "task/query", {"taskIds": [task_id]})
+            if err:
+                # 单次查询失败不致命，继续重试
+                logger.warning(f"吐司任务查询失败（将继续重试）: {err}")
+                continue
+            tasks = data.get("tasks") or []
+            if not tasks:
+                continue
+            task = tasks[0] or {}
+            status = str(task.get("status") or "").upper()
+            last_status = status
+            if status == "FINISH":
+                return self._tusi_open_outputs(task), None
+            if status in ("EXCEPTION", "CANCELED"):
+                info = task.get("message") or task.get("error") or task.get("failedInfo") or ""
+                detail = " ".join(str(info).split())[:200]
+                word = "失败" if status == "EXCEPTION" else "已取消"
+                return None, f"❌ 吐司任务{word}{f'：{detail}' if detail else ''}"
+        return None, f"⏰ 吐司任务等待超时（最后状态：{last_status or '未知'}），请稍后重试"
+
+    @staticmethod
+    def _tusi_open_outputs(task: Dict[str, Any]) -> List[str]:
+        """从任务结果里收集输出文件 URL"""
+        urls: List[str] = []
+        for out in (task.get("outputs") or []):
+            value = out.get("value") if isinstance(out, dict) else out
+            if isinstance(value, dict):
+                value = value.get("url") or value.get("displayUrl") or value.get("accessUrl")
+            if isinstance(value, str) and value.startswith("http") and value not in urls:
+                urls.append(value)
+        return urls
+
+    async def _tusi_open_run(self, cfg: Dict[str, Any], tool_name: str,
+                             requirement: str, image_urls: List[str]) -> tuple:
+        """创建并等待一个吐司 OpenAPI 生成任务，返回 (结果 URL 列表, 错误文案)"""
+        if not tool_name:
+            return None, (
+                "⚠️ 未指定工具\n"
+                "用法：/生图 吐司API [工具名] 描述\n"
+                "可在后台「吐司 OpenAPI 默认工具」填写默认工具，或发「/生图工具」查看可选工具"
+            )
+        tool, err = await self._tusi_open_find_tool(cfg, tool_name)
+        if err:
+            return None, err
+        if tool is None:
+            return None, f"❌ 未找到工具「{tool_name}」，发「/生图工具」查看可用工具"
+        inputs_def = tool.get("inputs") or []
+        if any(str((i or {}).get("type") or "").upper() == "FILE" for i in inputs_def) \
+                and not image_urls:
+            return None, "⚠️ 该工具需要参考图片，请把图片和命令放在同一条消息里发送"
+        inputs, err = await self._tusi_open_build_inputs(tool, requirement, image_urls)
+        if err:
+            return None, err
+        data, err = await self._tusi_open_api(
+            cfg, "task", {"toolName": tool.get("name") or tool_name, "inputs": inputs}
+        )
+        if err:
+            return None, err
+        task = data.get("task") or {}
+        task_id = str(task.get("id") or "").strip()
+        if not task_id:
+            return None, "❌ 吐司未返回任务 ID，请稍后重试"
+        return await self._tusi_open_wait(cfg, task_id)
+
+    async def _tusi_open_download(self, url: str) -> tuple:
+        """下载生成结果到临时文件，返回 (本地路径, 媒体类型, 错误文案)"""
+        ctype = ""
+        try:
+            session = await self._get_http_session()
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=TUSI_OPEN_REQUEST_TIMEOUT),
+                proxy=self._get_proxy(),
+            ) as resp:
+                if resp.status != 200:
+                    return None, "", f"HTTP {resp.status}"
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                body = await self._read_capped(resp, TUSI_OPEN_MAX_RESULT_BYTES)
+                if body is None:
+                    return None, "", "结果过大"
+        except Exception as e:
+            logger.error(f"下载吐司结果失败: {e}")
+            return None, "", "下载失败"
+        ext = _MEDIA_EXT_BY_CTYPE.get(ctype) or os.path.splitext(
+            urllib.parse.urlparse(url).path
+        )[1] or ".png"
+        kind = "video" if (ctype.startswith("video/") or ext in _VIDEO_EXTS) else "image"
+        return self._bytes_to_tempfile(body, ext, "tusiopen"), kind, None
+
+    @staticmethod
+    def _collect_event_images(event: AstrMessageEvent) -> List[str]:
+        """收集消息里的图片（URL 或本地路径）"""
+        srcs: List[str] = []
+        try:
+            comps = event.message_obj.message
+        except Exception:
+            return srcs
+        for comp in comps or []:
+            if type(comp).__name__ != "Image":
+                continue
+            val = getattr(comp, "url", None) or getattr(comp, "file", None)
+            if val:
+                srcs.append(str(val))
+        return srcs
+
     # ==================== 指令：/生图 ====================
 
     @filter.command("生图")
     async def cmd_image_gen(self, event: AstrMessageEvent):
         """/生图 中文描述 → 大模型转英文绘画 tag → 生图并发送
 
-        加「吐司」前缀（/生图 吐司 描述）则改走吐司（TAMS）接口。
+        渠道前缀：
+        - /生图 吐司 描述             走吐司 TAMS 模板接口
+        - /生图 吐司API [工具名] 描述   走吐司 OpenAPI（可附图作为参考）
         """
         if not self._nai_enabled():
             yield event.plain_result("⚠️「/生图」功能已被管理员关闭")
             return
 
         raw = self._strip_command(event.message_str, "生图")
-        use_tusi, text = _split_tusi_prefix(raw)
-        if not text:
+        use_open, text = _split_tusi_open_prefix(raw)
+        use_tusi = False
+        if not use_open:
+            use_tusi, text = _split_tusi_prefix(raw)
+
+        image_srcs = self._collect_event_images(event) if use_open else []
+
+        if not text and not image_srcs:
             yield event.plain_result(
                 "用法：/生图 中文描述\n"
-                "      /生图 吐司 中文描述（走吐司接口）\n"
+                "      /生图 吐司 中文描述（走吐司 TAMS 接口）\n"
+                "      /生图 吐司API [工具名] 中文描述（走吐司 OpenAPI，可附图）\n"
                 "示例：/生图 蓝发少女站在樱花树下，微笑，逆光\n"
-                "查看配置与可用模型：/生图帮助"
+                "查看配置与可用模型：/生图帮助；查看吐司工具：/生图工具"
             )
             return
         if len(text) > MAX_NAI_PROMPT_CHARS:
@@ -769,8 +1184,18 @@ class NaiImagePlugin(Star):
 
         # 按渠道取配置
         nai_cfg = self._nai_cfg()
-        tusi_cfg = self._tusi_cfg() if use_tusi else None
-        if use_tusi:
+        open_cfg = None
+        tusi_cfg = None
+        if use_open:
+            open_cfg = self._tusi_open_cfg()
+            if not open_cfg["key"]:
+                yield event.plain_result(
+                    "⚠️ 尚未配置吐司 OpenAPI Access Key\n"
+                    "请在后台插件配置中填写「吐司 OpenAPI Access Key」"
+                )
+                return
+        elif use_tusi:
+            tusi_cfg = self._tusi_cfg()
             if not (tusi_cfg["api_key"] and tusi_cfg["template_id"]):
                 yield event.plain_result(
                     "⚠️ 吐司生图尚未配置完整\n"
@@ -795,6 +1220,53 @@ class NaiImagePlugin(Star):
 
         self._img_busy.add(busy_key)
         try:
+            if use_open:
+                tool_name, requirement, terr = await self._resolve_tusi_open_tool(open_cfg, text)
+                if terr:
+                    yield event.plain_result(terr)
+                    return
+                if not requirement and not image_srcs:
+                    yield event.plain_result(
+                        "用法：/生图 吐司API [工具名] 中文描述（可附图片作为参考）"
+                    )
+                    return
+                yield event.plain_result(f"🍞 正在处理（吐司工具：{tool_name or '未指定'}）…")
+                image_urls: List[str] = []
+                for src in image_srcs[:4]:
+                    blob, fname = await self._tusi_open_fetch_image(src)
+                    if not blob:
+                        continue
+                    url, uerr = await self._tusi_open_upload(
+                        open_cfg, blob, fname or "reference.png"
+                    )
+                    if uerr:
+                        yield event.plain_result(uerr)
+                        return
+                    image_urls.append(url)
+                urls, err = await self._tusi_open_run(open_cfg, tool_name, requirement, image_urls)
+                if err:
+                    yield event.plain_result(err)
+                    return
+                if not urls:
+                    yield event.plain_result("❌ 吐司任务已完成，但没有返回结果")
+                    return
+                self._img_quota_commit(event, nai_cfg["limit"])
+                for url in urls[:TUSI_OPEN_MAX_RESULTS]:
+                    path, kind, derr = await self._tusi_open_download(url)
+                    if derr or not path:
+                        yield event.plain_result(f"🎨 结果链接：{url}")
+                        continue
+                    if kind == "video":
+                        sender = getattr(event, "video_result", None)
+                        if callable(sender):
+                            yield sender(path)
+                        else:
+                            yield event.plain_result(f"🎬 视频已生成：\n{url}")
+                    else:
+                        yield event.image_result(path)
+                    self._schedule_tempfile_cleanup(path)
+                return
+
             yield event.plain_result("🎨 正在把描述转换成绘画关键词…")
             positive, negative, err = await self._convert_to_tags(text)
             if err:
@@ -839,7 +1311,10 @@ class NaiImagePlugin(Star):
             lines.append("用法：/生图 中文描述")
             lines.append("示例：/生图 蓝发少女站在樱花树下，微笑，逆光")
             if self._tusi_ready():
-                lines.append("走吐司接口：/生图 吐司 中文描述")
+                lines.append("走吐司 TAMS：/生图 吐司 中文描述")
+            if self._tusi_open_ready():
+                lines.append("走吐司 OpenAPI：/生图 吐司API [工具名] 中文描述")
+                lines.append("查看吐司工具列表：/生图工具")
         else:
             lines.append("⛔ 当前已被管理员关闭，请在后台插件配置中开启")
         lines.append("")
@@ -859,6 +1334,13 @@ class NaiImagePlugin(Star):
         lines.append(f"状态：{'已配置' if tusi_ok else '未配置（需填 API Key 与模板 ID）'}")
         lines.append(f"接口：{tusi['base_url']}")
         lines.append(f"模板：{tusi['template_id'] or '（未填写）'}")
+
+        ocfg = self._tusi_open_cfg()
+        lines.append("")
+        lines.append("【吐司 OpenAPI】")
+        lines.append(f"状态：{'已配置' if ocfg['key'] else '未配置（需填 Access Key）'}")
+        lines.append(f"接口：{ocfg['base_url']}")
+        lines.append(f"默认工具：{ocfg['default_tool'] or '（未填写）'}")
 
         provider_id = str(self.config.get("nai_tag_provider") or "").strip()
         lines.append("")
@@ -885,6 +1367,42 @@ class NaiImagePlugin(Star):
                 except Exception:
                     continue
 
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("生图工具")
+    async def cmd_image_gen_tools(self, event: AstrMessageEvent):
+        """/生图工具 → 列出吐司 OpenAPI 当前可用的 AI 工具"""
+        cfg = self._tusi_open_cfg()
+        if not cfg["key"]:
+            yield event.plain_result(
+                "⚠️ 尚未配置吐司 OpenAPI Access Key\n"
+                "请在后台插件配置中填写后再使用「/生图工具」"
+            )
+            return
+        tools, err = await self._tusi_open_list_tools(cfg, force=True)
+        if err:
+            yield event.plain_result(err)
+            return
+        if not tools:
+            yield event.plain_result("⚠️ 吐司未返回任何工具")
+            return
+        lines = ["🧰 吐司可用工具", "━━━━━━━━━━━━", "用法：/生图 吐司API 工具名 中文描述", ""]
+        shown = 0
+        for tool in tools[:50]:
+            name = str((tool or {}).get("name") or "").strip()
+            if not name:
+                continue
+            cost = (tool or {}).get("estimatedCost")
+            desc = str((tool or {}).get("description") or "").replace("\n", " ").strip()
+            head = f"• {name}"
+            if cost not in (None, ""):
+                head += f"（算力 {cost}）"
+            lines.append(head)
+            if desc:
+                lines.append(f"  {desc[:80]}")
+            shown += 1
+        if len(tools) > shown:
+            lines.append(f"…（共 {len(tools)} 个，仅显示前 {shown} 个）")
         yield event.plain_result("\n".join(lines))
 
     # ==================== 临时文件管理 ====================
