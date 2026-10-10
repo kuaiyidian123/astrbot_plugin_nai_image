@@ -58,9 +58,10 @@
   },
   "nai_tag_provider": {
     "type": "string",
-    "title": "生图 tag 转换模型 ID（可留空）",
+    "title": "生图 tag 转换模型（下拉选择，可留空）",
     "default": "",
-    "description": "用于把中文描述转成英文绘画 tag 的对话模型 ID；留空则使用 AstrBot 当前默认对话模型。可用 ID 可发送 /生图帮助 查看。"
+    "_special": "select_provider",
+    "description": "下拉选择把中文描述转成英文绘画 tag 的对话模型；留空则使用 AstrBot 当前默认对话模型。"
   },
   "nai_daily_limit": {
     "type": "int",
@@ -69,6 +70,18 @@
     "minimum": 0,
     "maximum": 1000,
     "description": "每位用户每天最多生图次数，默认 5；填 0 表示不限制。生图会消耗 Anlas 额度，建议设置上限。"
+  },
+  "nai_group_blacklist": {
+    "type": "list",
+    "title": "生图群聊黑名单",
+    "hint": "在此列表中的群聊将被禁用 /生图（不影响私聊）。填群号，一行一个。",
+    "default": []
+  },
+  "nai_user_blacklist": {
+    "type": "list",
+    "title": "生图 QQ 黑名单",
+    "hint": "在此列表中的 QQ 号将被禁止使用 /生图。填 QQ 号，一行一个。",
+    "default": []
   },
   "tusi_base_url": {
     "type": "string",

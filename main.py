@@ -42,6 +42,19 @@ NAI_TAG_SYSTEM_PROMPT = (
     "1. 只输出绘画关键词，不要完整长句子\n"
     "2. 二次元插画风格，masterpiece, best quality放最前面\n"
     "3. 负面词固定包含：lowres, bad anatomy, bad hands, extra limbs, deformed, blurry, ugly\n"
+    "4. 严格只输出上面两行，「正向tag：」「负面tag：」这两个标签要原样保留，不要改写成别的词\n"
+    "5. 不要输出任何解释、不要用 markdown 或代码块、不要反问\n"
+    "6. 即使描述不是一个具体画面，也要转成最接近的绘画关键词，不要拒绝\n"
+)
+# 中文描述 -> NovelAI 英文绘画 tag 的**用户消息**模板
+# 同一套规则在 system 与 user 里各说一遍：部分中转/模型会忽略或不重视 system 提示词，
+# 只靠 system_prompt 时会答非所问，导致格式解析失败。
+NAI_TAG_USER_TEMPLATE = (
+    "请把下面的中文描述转成英文绘画 tag。\n"
+    "只输出两行，格式必须是（不要解释、不要 markdown、不要代码块）：\n"
+    "正向tag：<英文关键词，逗号分隔>\n"
+    "负面tag：<英文关键词，逗号分隔>\n"
+    "中文描述：{text}"
 )
 # 固定必须出现的负面词（大模型漏掉时自动补齐）
 NAI_REQUIRED_NEGATIVE = [
@@ -114,6 +127,62 @@ def _split_tusi_prefix(text: str) -> tuple:
     return False, raw
 
 
+def _sniff_image_suffix(data: bytes) -> str:
+    """按文件头判断图片真实格式，避免把 JPEG/WebP 存成 .png 导致平台发送失败"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:2] == b"\xff\xd8":
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:3] == b"GIF":
+        return ".gif"
+    return ".png"
+
+
+def _clean_tag_line(s: str) -> str:
+    """清理大模型输出的一行 tag：去掉 markdown 装饰与首尾标点
+
+    注意 `*` 与反引号一定不属于 tag，直接全行剔除（能修好 `**正向tag**：` 这类
+    夹在标签与冒号之间的加粗符号）；下划线与连字符可能是 tag 的一部分，保留。
+    """
+    s = str(s or "").replace("*", "").replace("`", "")
+    s = re.sub(r"^[\s#>+\-|]+", "", s)
+    s = re.sub(r"[\s|]+$", "", s)
+    return s.strip(" ,，;；.")
+
+
+# 「正向tag / 负面tag」的标签行（冒号可有可无，内容也可能落在下一行）
+_TAG_LABEL_NEG = re.compile(
+    r"^(?:负面|反向|负向|negative)\s*(?:tags?|标签|关键词|prompt)?\s*[：:、]?\s*(.*)$",
+    re.IGNORECASE,
+)
+_TAG_LABEL_POS = re.compile(
+    r"^(?:正向|正面|positive|prompt)\s*(?:tags?|标签|关键词|prompt)?\s*[：:、]?\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _match_tag_label(line: str) -> tuple:
+    """判断一行是否为标签行，返回 ("pos"/"neg", 同行内容)；不是标签行返回 (None, "")"""
+    m = _TAG_LABEL_NEG.match(line)
+    if m:
+        return "neg", m.group(1).strip()
+    m = _TAG_LABEL_POS.match(line)
+    if m:
+        return "pos", m.group(1).strip()
+    return None, ""
+
+
+def _looks_like_tag_list(text: str) -> bool:
+    """判断整段文本是否像一串英文绘画 tag（模型没写标签时的兜底依据）"""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s or len(s) > 400 or "," not in s:
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", s))
+    return cjk / len(s) <= 0.1
+
+
 def _split_tusi_open_prefix(text: str) -> tuple:
     """识别「/生图 吐司API xxx」中的渠道前缀，返回 (是否走 OpenAPI, 剩余描述)
 
@@ -182,7 +251,7 @@ def _describe_llm_error(err: Exception) -> str:
         tip = "原因：调用模型时出错"
     if detail:
         tip += f"\n原始错误：{detail[:160]}{'…' if len(detail) > 160 else ''}"
-    tip += "\n（可在后台把「生图 tag 转换模型 ID」换成其他可用模型）"
+    tip += "\n（可在后台「生图 tag 转换模型」下拉里换其他可用模型）"
     return tip
 
 
@@ -199,6 +268,8 @@ DEFAULT_CONFIG = {
     "nai_negative_extra": "",
     "nai_tag_provider": "",
     "nai_daily_limit": 5,
+    "nai_group_blacklist": [],
+    "nai_user_blacklist": [],
     "tusi_base_url": TUSI_DEFAULT_BASE_URL,
     "tusi_api_key": "",
     "tusi_template_id": "",
@@ -226,7 +297,7 @@ TEMP_FILE_PREFIX = "nai_image_"
     "astrbot_plugin_nai_image",
     "kuaiyidian123",
     "AI 生图插件：/生图 中文描述 走 NovelAI，/生图 吐司 描述 走吐司（TAMS），/生图 吐司API 描述 走吐司 OpenAPI，由大模型生成绘画 tag/参数",
-    "1.1.0",
+    "1.2.0",
 )
 class NaiImagePlugin(Star):
     """AI 生图插件（NovelAI / 吐司）"""
@@ -311,6 +382,37 @@ class NaiImagePlugin(Star):
     def _nai_enabled(self) -> bool:
         """「/生图」功能开关"""
         return bool(self.config.get("enable_image_gen", False))
+
+    @staticmethod
+    def _norm_id_set(raw) -> set:
+        """把配置里的黑名单归一化成 ID 集合，兼容 list 与逗号/空格分隔的字符串"""
+        if isinstance(raw, str):
+            raw = re.split(r"[,，、;；\s]+", raw)
+        elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raw = [raw]
+        try:
+            items = list(raw or [])
+        except TypeError:
+            return set()
+        return {str(it).strip() for it in items if str(it).strip()}
+
+    def _nai_blacklist_hit(self, event: AstrMessageEvent) -> str:
+        """命中生图黑名单时返回提示文案，未命中返回空串"""
+        groups = self._norm_id_set(self.config.get("nai_group_blacklist"))
+        users = self._norm_id_set(self.config.get("nai_user_blacklist"))
+        if not groups and not users:
+            return ""
+        uid = self._get_user_id(event)
+        if uid and uid in users:
+            return "⚠️ 你已被管理员加入 /生图 黑名单，无法使用该功能"
+        if groups:
+            try:
+                gid = str(event.get_group_id() or "")
+            except Exception:
+                gid = ""
+            if gid and gid in groups:
+                return "⚠️ 本群已被管理员禁用 /生图"
+        return ""
 
     def _nai_cfg(self) -> Dict[str, Any]:
         """解析并收敛生图配置（后台填错也不会直接崩，统一夹紧到安全范围）"""
@@ -400,22 +502,40 @@ class NaiImagePlugin(Star):
         if prov is None:
             return None, (
                 "❌ 未找到可用的对话模型\n"
-                "请在 AstrBot 中配置模型，或在后台把「生图 tag 转换模型 ID」改成本实例已有的模型 ID"
+                "请在 AstrBot 中配置模型，或在后台「生图 tag 转换模型」下拉里选一个本实例已有的模型"
             )
         return prov, None
 
     @staticmethod
     def _parse_tag_output(text: str) -> tuple:
-        """从大模型输出中解析「正向tag / 负面tag」"""
-        raw = text or ""
-        pos = ""
-        neg = ""
-        m = re.search(r"正向\s*tag\s*[：:]\s*(.+)", raw, re.IGNORECASE)
-        if m:
-            pos = m.group(1).strip()
-        m = re.search(r"负面\s*tag\s*[：:]\s*(.+)", raw, re.IGNORECASE)
-        if m:
-            neg = m.group(1).strip()
+        """从大模型输出中解析「正向tag / 负面tag」
+
+        大模型不一定严格按格式回答，这里逐行容错：中/英标签、有无冒号、
+        内容写在同一行或折到下一行、markdown 加粗与代码块都支持；
+        若整段完全没写标签但本身就是一串英文 tag，则直接当作正向 tag 使用。
+        """
+        raw = re.sub(r"```[a-zA-Z]*", "", str(text or ""))
+        pos_parts: List[str] = []
+        neg_parts: List[str] = []
+        cur = None      # 当前处于哪个标签块下（'pos' / 'neg'），用于接住折行的内容
+        for line in raw.splitlines():
+            line = _clean_tag_line(line)
+            if not line:
+                continue
+            kind, rest = _match_tag_label(line)
+            if kind:
+                cur = kind
+                if rest:
+                    (pos_parts if kind == "pos" else neg_parts).append(rest)
+                continue
+            if cur == "pos":
+                pos_parts.append(line)
+            elif cur == "neg":
+                neg_parts.append(line)
+        pos = _clean_tag_line(", ".join(pos_parts))
+        neg = _clean_tag_line(", ".join(neg_parts))
+        if not pos and _looks_like_tag_list(raw):
+            pos = _clean_tag_line(re.sub(r"\s+", " ", raw))
         return pos, neg
 
     @staticmethod
@@ -447,19 +567,29 @@ class NaiImagePlugin(Star):
             return "", "", err
         try:
             resp = await prov.text_chat(
-                prompt=f"中文描述：{text}",
+                prompt=NAI_TAG_USER_TEMPLATE.format(text=text),
                 system_prompt=NAI_TAG_SYSTEM_PROMPT,
             )
         except Exception as e:
             logger.error(f"调用对话模型转换绘画 tag 失败: {e}")
             return "", "", f"❌ 调用对话模型失败\n{_describe_llm_error(e)}"
+        # 不同 provider 返回的对象/字段不一致：优先取 completion_text，
+        # 部分实现直接返回字符串，这里一并兼容，避免误报"没有返回内容"
         raw = str(getattr(resp, "completion_text", "") or "").strip()
+        if not raw and isinstance(resp, str):
+            raw = resp.strip()
         if not raw:
             return "", "", "❌ 对话模型没有返回内容，请稍后重试"
         pos, neg = self._parse_tag_output(raw)
         if not pos:
             logger.warning(f"绘画 tag 解析失败，原始输出: {raw[:200]}")
-            return "", "", "❌ 关键词转换结果格式异常，请重试或换个描述"
+            preview = " ".join(raw.split())[:80]
+            return "", "", (
+                "❌ 关键词转换结果格式异常\n"
+                "通常是当前对话模型没有按约定格式输出，可重试或换个描述；"
+                "若持续出现，可在后台「生图 tag 转换模型」下拉里换其他模型\n"
+                f"模型原始输出：{preview}"
+            )
         return pos, neg, None
 
     # ---------- NovelAI 接口 ----------
@@ -689,7 +819,7 @@ class NaiImagePlugin(Star):
                     body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
                     if body is None:
                         continue
-                    if resp.status != 200:
+                    if not 200 <= resp.status < 300:
                         logger.warning(f"吐司查询作业失败 HTTP {resp.status}")
                         return None, self._tusi_error_msg(resp.status, body)
                 data = json.loads(body.decode("utf-8", "ignore")) or {}
@@ -714,7 +844,8 @@ class NaiImagePlugin(Star):
                           if isinstance(info, (dict, list)) else str(info))
                 detail = " ".join(detail.split())[:200]
                 logger.warning(f"吐司作业失败: {detail}")
-                return None, f"❌ 吐司生图失败{f'{chr(10)}{detail}' if detail else ''}"
+                tail = f"\n{detail}" if detail else ""
+                return None, f"❌ 吐司生图失败{tail}"
             # WAITING / RUNNING 等状态：继续等待
         return None, "⏰ 吐司生图等待超时，请稍后重试"
 
@@ -739,7 +870,7 @@ class NaiImagePlugin(Star):
                 body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
                 if body is None:
                     return None, "❌ 吐司模板信息过大，已中止接收"
-                if resp.status != 200:
+                if not 200 <= resp.status < 300:
                     logger.warning(f"吐司取模板失败 HTTP {resp.status}")
                     return None, self._tusi_error_msg(resp.status, body)
             try:
@@ -783,7 +914,7 @@ class NaiImagePlugin(Star):
                 body = await self._read_capped(resp, TUSI_MAX_JSON_BYTES)
                 if body is None:
                     return None, "❌ 吐司返回内容过大，已中止接收"
-                if resp.status != 200:
+                if not 200 <= resp.status < 300:
                     logger.warning(f"吐司提交作业失败 HTTP {resp.status}")
                     return None, self._tusi_error_msg(resp.status, body)
             try:
@@ -1162,6 +1293,11 @@ class NaiImagePlugin(Star):
             yield event.plain_result("⚠️「/生图」功能已被管理员关闭")
             return
 
+        blocked = self._nai_blacklist_hit(event)
+        if blocked:
+            yield event.plain_result(blocked)
+            return
+
         raw = self._strip_command(event.message_str, "生图")
         use_open, text = _split_tusi_open_prefix(raw)
         use_tusi = False
@@ -1293,7 +1429,7 @@ class NaiImagePlugin(Star):
 
             # 仅在成功后计数，避免网络/配置问题白扣用户次数
             self._img_quota_commit(event, nai_cfg["limit"])
-            image_path = self._bytes_to_tempfile(image, ".png", "aigen")
+            image_path = self._bytes_to_tempfile(image, _sniff_image_suffix(image), "aigen")
             yield event.image_result(image_path)
             self._schedule_tempfile_cleanup(image_path)
         except Exception as e:
@@ -1352,6 +1488,11 @@ class NaiImagePlugin(Star):
         else:
             lines.append("次数限制：不限")
 
+        blocked = self._nai_blacklist_hit(event)
+        if blocked:
+            lines.append("")
+            lines.append(blocked)
+
         try:
             providers = list(self.context.get_all_providers())
         except Exception as e:
@@ -1359,7 +1500,7 @@ class NaiImagePlugin(Star):
             providers = []
         if providers:
             lines.append("")
-            lines.append("可选转换模型 ID（填到后台「生图 tag 转换模型 ID」）：")
+            lines.append("可选转换模型（在后台「生图 tag 转换模型」下拉里选择）：")
             for i, prov in enumerate(providers[:20], 1):
                 try:
                     meta = prov.meta()
